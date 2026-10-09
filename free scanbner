@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+Shopify Freebie / GWP Scanner
+-----------------------------
+Scans a Shopify store's public products.json feed for:
+  - $0.00 priced variants that are available (in stock)
+  - Products whose title/handle/tags suggest free gifts, GWP, samples, bonuses, trials
+
+Usage:
+  python3 shopify_freebie_scanner.py https://example.com
+  python3 shopify_freebie_scanner.py example.com --json out.json
+  python3 shopify_freebie_scanner.py https://a.com https://b.com --csv results.csv
+  python3 shopify_freebie_scanner.py stores.txt --include-oos
+
+stores.txt = one store URL or domain per line (comments with # allowed)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
+
+try:
+    import requests
+except ImportError:
+    print("Install requests: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; ShopifyFreebieScanner/1.1; +https://github.com/local)"
+)
+TIMEOUT = 25
+MAX_PAGES = 40          # 250 products/page → up to 10k products
+REQUEST_DELAY = 0.35    # polite pause between pages
+MAX_WORKERS = 4         # parallel stores
+
+# Strong signals in title/handle (word-ish boundaries preferred)
+TITLE_KEYWORDS = (
+    "free gift",
+    "free sample",
+    "free trial",
+    "gwp",
+    "complimentary",
+    "mystery gift",
+    "try before",
+    "pay only shipping",
+    "starter kit free",
+    "free with",
+    "bogo",
+    "buy 1 get",
+    "buy one get",
+)
+
+# Single tokens only counted in title/handle when not part of noise phrases
+TITLE_TOKENS = (
+    "free",
+    "sample",
+    "bonus",
+    "trial",
+    "gift",
+)
+
+# Tag-only signals (must appear as a whole tag, case-insensitive)
+TAG_KEYWORDS = (
+    "gwp",
+    "free-gift",
+    "freegift",
+    "freebie",
+    "sample",
+    "complimentary",
+    "try-before-you-buy",
+    "bogo",
+    "buy1get1",
+)
+
+# Phrases that contain "free"/"gift" but are not freebies
+NOISE_PHRASES = (
+    re.compile(r"free[-\s]?shipping", re.I),
+    re.compile(r"free[-\s]?returns?", re.I),
+    re.compile(r"free[-\s]?freight", re.I),
+    re.compile(r"\bgift\s*card\b", re.I),
+    re.compile(r"\be-?gift\b", re.I),
+    re.compile(r"\bvoucher\b", re.I),
+    re.compile(r"no[-\s]?promo", re.I),
+    re.compile(r"exclude[-\s]?promo", re.I),
+)
+
+
+@dataclass
+class Hit:
+    store: str
+    product_id: int
+    title: str
+    handle: str
+    product_url: str
+    variant_id: int
+    variant_title: str
+    price: str
+    compare_at_price: Optional[str]
+    available: bool
+    sku: Optional[str]
+    tags: list[str] = field(default_factory=list)
+    reason: str = ""  # why it matched: "price_zero" | "keyword:..." | both
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def normalize_store(raw: str) -> str:
+    raw = raw.strip()
+    if not raw or raw.startswith("#"):
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+
+def strip_noise(text: str) -> str:
+    """Remove known non-freebie phrases so leftover 'free'/'gift' is meaningful."""
+    cleaned = text
+    for pat in NOISE_PHRASES:
+        cleaned = pat.sub(" ", cleaned)
+    return cleaned
+
+
+def keyword_hits(title: str, handle: str, tags: list[str]) -> list[str]:
+    """Return list of reason tokens explaining why this product looks free/GWP."""
+    reasons: list[str] = []
+    title_h = f"{title} {handle.replace('-', ' ')}"
+    cleaned = strip_noise(title_h).lower()
+
+    for kw in TITLE_KEYWORDS:
+        if kw in cleaned:
+            reasons.append(kw)
+
+    for tok in TITLE_TOKENS:
+        # whole-word-ish match to avoid partials already covered
+        if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", cleaned):
+            if tok not in reasons and not any(tok in r for r in reasons):
+                reasons.append(tok)
+
+    tag_set = {str(t).strip().lower() for t in tags}
+    for tk in TAG_KEYWORDS:
+        if tk in tag_set or any(tk in t for t in tag_set):
+            # avoid free-shipping style tags
+            if "shipping" in tk or "return" in tk:
+                continue
+            if not any(tk in r for r in reasons):
+                reasons.append(f"tag:{tk}")
+
+    return reasons
+
+
+def fetch_products_page(
+    session: requests.Session, base: str, page: int
+) -> list[dict[str, Any]]:
+    url = f"{base}/products.json"
+    params = {"limit": 250, "page": page}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        r = session.get(url, params=params, headers=headers, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        raise RuntimeError(f"request failed: {e}") from e
+
+    if r.status_code == 404:
+        return []
+    if r.status_code == 403:
+        raise RuntimeError("403 Forbidden (Cloudflare/bot protection or private catalog)")
+    if r.status_code == 429:
+        raise RuntimeError("429 Too Many Requests — slow down or retry later")
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+
+    # Some stores return HTML challenge pages with 200
+    ctype = r.headers.get("Content-Type", "")
+    if "json" not in ctype and not r.text.lstrip().startswith(("{", "[")):
+        raise RuntimeError("non-JSON response (likely bot protection)")
+
+    data = r.json()
+    return data.get("products") or []
+
+
+def scan_store(
+    store: str,
+    include_oos: bool = False,
+    include_gift_cards: bool = False,
+    strict: bool = False,
+    loose: bool = False,
+) -> tuple[list[Hit], Optional[str]]:
+    """
+    Returns (hits, error_message).
+    error_message is set if the store could not be scanned at all.
+    """
+    base = normalize_store(store)
+    if not base:
+        return [], f"invalid store URL: {store!r}"
+
+    session = requests.Session()
+    hits: list[Hit] = []
+    seen_variant_ids: set[int] = set()
+
+    try:
+        for page in range(1, MAX_PAGES + 1):
+            products = fetch_products_page(session, base, page)
+            if not products:
+                break
+
+            for p in products:
+                title = p.get("title") or ""
+                handle = p.get("handle") or ""
+                tags = p.get("tags") or []
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                product_id = p.get("id") or 0
+                product_url = f"{base}/products/{handle}"
+
+                kw = keyword_hits(title, handle, tags)
+                # Gift cards: only keep if price is actually $0 (rare) unless user opts in
+                if not include_gift_cards and any(
+                    pat.search(title) for pat in NOISE_PHRASES if "gift" in pat.pattern
+                ):
+                    kw = [k for k in kw if k not in ("gift", "free")]
+
+                # Strong free signal in title (not just a BOGO tag on a full-price product)
+                title_l = title.lower().strip()
+                strong_free = bool(
+                    re.match(r"^(free|complimentary)\b", title_l)
+                    or "free gift" in title_l
+                    or "free sample" in title_l
+                    or "gwp" in title_l
+                    or re.search(r"\bfree\b.+\b(gift|sample|trial|bonus)\b", title_l)
+                    or re.search(r"\b(gift|sample|trial|bonus)\b.+\bfree\b", title_l)
+                )
+
+                for v in p.get("variants") or []:
+                    vid = v.get("id")
+                    if vid is None or vid in seen_variant_ids:
+                        continue
+                    seen_variant_ids.add(vid)
+
+                    try:
+                        price_f = float(v.get("price") or "999")
+                    except (TypeError, ValueError):
+                        price_f = 999.0
+
+                    available = bool(v.get("available"))
+                    if not include_oos and not available:
+                        continue
+
+                    reasons: list[str] = []
+                    is_zero = price_f == 0 or price_f < 0.01
+                    if is_zero:
+                        reasons.append("price_zero")
+
+                    if not strict:
+                        # Default: keyword only when title looks free OR price is ~$0–$1
+                        if strong_free or (kw and price_f <= 1.0):
+                            if kw:
+                                reasons.append("keyword:" + ",".join(kw[:5]))
+                            elif strong_free:
+                                reasons.append("keyword:title_free")
+                        elif loose and kw:
+                            # Noisy mode: any BOGO/free tag even on full-price SKUs
+                            reasons.append("keyword:" + ",".join(kw[:5]))
+
+                    if not reasons:
+                        continue
+
+                    hits.append(
+                        Hit(
+                            store=base,
+                            product_id=int(product_id),
+                            title=title,
+                            handle=handle,
+                            product_url=product_url,
+                            variant_id=int(vid),
+                            variant_title=v.get("title") or "Default Title",
+                            price=str(v.get("price") or "0.00"),
+                            compare_at_price=v.get("compare_at_price"),
+                            available=available,
+                            sku=v.get("sku"),
+                            tags=list(tags),
+                            reason=" + ".join(reasons),
+                        )
+                    )
+
+            if len(products) < 250:
+                break
+            time.sleep(REQUEST_DELAY)
+
+    except RuntimeError as e:
+        return hits, f"{base}: {e}"
+    except Exception as e:  # noqa: BLE001
+        return hits, f"{base}: unexpected error: {e}"
+
+    return hits, None
+
+
+def load_store_list(paths_or_urls: Iterable[str]) -> list[str]:
+    stores: list[str] = []
+    for item in paths_or_urls:
+        item = item.strip()
+        if not item:
+            continue
+        # file of stores?
+        if item.endswith(".txt") or (not item.startswith("http") and "/" not in item and "." not in item):
+            try:
+                with open(item, encoding="utf-8") as f:
+                    for line in f:
+                        n = normalize_store(line)
+                        if n:
+                            stores.append(n)
+                continue
+            except OSError:
+                pass
+        n = normalize_store(item)
+        if n:
+            stores.append(n)
+    # dedupe preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in stores:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def print_hits(hits: list[Hit], show_oos: bool) -> None:
+    if not hits:
+        print("  (no free / $0 / GWP matches found)")
+        return
+
+    # group by store then by product
+    by_store: dict[str, list[Hit]] = {}
+    for h in hits:
+        by_store.setdefault(h.store, []).append(h)
+
+    for store, store_hits in by_store.items():
+        print(f"\n{'=' * 72}")
+        print(f"STORE: {store}")
+        print(f"{'=' * 72}")
+
+        by_product: dict[str, list[Hit]] = {}
+        for h in store_hits:
+            by_product.setdefault(h.handle, []).append(h)
+
+        for handle, phits in by_product.items():
+            h0 = phits[0]
+            stock = "AVAILABLE" if any(x.available for x in phits) else "OOS"
+            if not show_oos and stock == "OOS":
+                continue
+            print(f"\n  [{stock}] {h0.title}")
+            print(f"         URL:  {h0.product_url}")
+            print(f"         Why:  {h0.reason}")
+            if h0.tags:
+                print(f"         Tags: {', '.join(h0.tags[:12])}")
+            for h in phits:
+                avail = "✓" if h.available else "✗"
+                sku = h.sku or "—"
+                print(
+                    f"         • variant {h.variant_id}  "
+                    f"[{h.variant_title}]  ${h.price}  "
+                    f"sku={sku}  in_stock={avail}"
+                )
+
+
+def write_json(path: str, hits: list[Hit], errors: list[str]) -> None:
+    payload = {
+        "hits": [asdict(h) for h in hits],
+        "errors": errors,
+        "count": len(hits),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\nWrote JSON → {path}")
+
+
+def write_csv(path: str, hits: list[Hit]) -> None:
+    fields = [
+        "store",
+        "title",
+        "handle",
+        "product_url",
+        "product_id",
+        "variant_id",
+        "variant_title",
+        "price",
+        "compare_at_price",
+        "available",
+        "sku",
+        "reason",
+        "tags",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for h in hits:
+            row = asdict(h)
+            row["tags"] = "|".join(h.tags)
+            w.writerow({k: row.get(k) for k in fields})
+    print(f"\nWrote CSV → {path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Scan Shopify stores for $0 / free / GWP products."
+    )
+    ap.add_argument(
+        "stores",
+        nargs="+",
+        help="Store URL(s), domain(s), or a .txt file with one store per line",
+    )
+    ap.add_argument(
+        "--include-oos",
+        action="store_true",
+        help="Include out-of-stock variants (default: only available)",
+    )
+    ap.add_argument(
+        "--include-gift-cards",
+        action="store_true",
+        help="Do not filter out gift-card products matched by 'gift' keyword",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Only report exact $0.00 available variants (ignore keyword-only matches)",
+    )
+    ap.add_argument(
+        "--loose",
+        action="store_true",
+        help="Also flag products with BOGO/free tags even if full price (noisier)",
+    )
+    ap.add_argument("--json", metavar="FILE", help="Write full results to JSON")
+    ap.add_argument("--csv", metavar="FILE", help="Write results to CSV")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_WORKERS,
+        help=f"Parallel store scans (default {MAX_WORKERS})",
+    )
+    args = ap.parse_args()
+
+    stores = load_store_list(args.stores)
+    if not stores:
+        print("No valid store URLs provided.", file=sys.stderr)
+        return 1
+
+    print(f"Scanning {len(stores)} store(s)…")
+    all_hits: list[Hit] = []
+    errors: list[str] = []
+
+    def _run(s: str) -> tuple[str, list[Hit], Optional[str]]:
+        hits, err = scan_store(
+            s,
+            include_oos=args.include_oos,
+            include_gift_cards=args.include_gift_cards,
+            strict=args.strict,
+            loose=args.loose,
+        )
+        return s, hits, err
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(_run, s): s for s in stores}
+        for fut in as_completed(futures):
+            store, hits, err = fut.result()
+            if err:
+                print(f"\n⚠  {err}", file=sys.stderr)
+                errors.append(err)
+            print(f"\n→ {store}: {len(hits)} match(es)")
+            print_hits(hits, show_oos=args.include_oos)
+            all_hits.extend(hits)
+
+    print(f"\n{'=' * 72}")
+    print(f"TOTAL matches: {len(all_hits)}  |  errors: {len(errors)}")
+
+    if args.json:
+        write_json(args.json, all_hits, errors)
+    if args.csv:
+        write_csv(args.csv, all_hits)
+
+    return 0 if not errors or all_hits else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
